@@ -8,8 +8,10 @@ import argparse
 import os
 import re
 import sys
+import json
 from urllib.parse import urljoin, urlparse, unquote
 from pathlib import Path
+from datetime import datetime
 
 try:
     import requests
@@ -18,6 +20,46 @@ except ImportError:
     print("Error: Required packages not installed.")
     print("Please run: pip install requests beautifulsoup4")
     sys.exit(1)
+
+
+# Common API key and token patterns
+SECRET_PATTERNS = {
+    'AWS Access Key': r'AKIA[0-9A-Z]{16}',
+    'AWS Secret Key': r'aws(.{0,20})?[\'"][0-9a-zA-Z/+]{40}[\'"]',
+    'GitHub Token': r'gh[pousr]_[0-9a-zA-Z]{36}',
+    'GitHub Classic Token': r'ghp_[0-9a-zA-Z]{36}',
+    'GitHub OAuth': r'gho_[0-9a-zA-Z]{36}',
+    'GitHub App Token': r'(ghu|ghs)_[0-9a-zA-Z]{36}',
+    'Google API Key': r'AIza[0-9A-Za-z\-_]{35}',
+    'Google OAuth': r'ya29\.[0-9A-Za-z\-_]+',
+    'Slack Token': r'xox[baprs]-[0-9a-zA-Z]{10,48}',
+    'Slack Webhook': r'https://hooks\.slack\.com/services/T[a-zA-Z0-9_]{8}/B[a-zA-Z0-9_]{8}/[a-zA-Z0-9_]{24}',
+    'Stripe API Key': r'sk_live_[0-9a-zA-Z]{24}',
+    'Stripe Restricted Key': r'rk_live_[0-9a-zA-Z]{24}',
+    'Square Access Token': r'sq0atp-[0-9A-Za-z\-_]{22}',
+    'Square OAuth Secret': r'sq0csp-[0-9A-Za-z\-_]{43}',
+    'Twilio API Key': r'SK[0-9a-fA-F]{32}',
+    'Twitter Access Token': r'[tT][wW][iI][tT][tT][eE][rR].*[1-9][0-9]+-[0-9a-zA-Z]{40}',
+    'Twitter OAuth': r'[tT][wW][iI][tT][tT][eE][rR].*[\'"][0-9a-zA-Z]{35,44}[\'"]',
+    'Facebook Access Token': r'EAACEdEose0cBA[0-9A-Za-z]+',
+    'Facebook OAuth': r'[fF][aA][cC][eE][bB][oO][oO][kK].*[\'"][0-9a-f]{32}[\'"]',
+    'Heroku API Key': r'[hH][eE][rR][oO][kK][uU].*[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}',
+    'MailChimp API Key': r'[0-9a-f]{32}-us[0-9]{1,2}',
+    'Mailgun API Key': r'key-[0-9a-zA-Z]{32}',
+    'SendGrid API Key': r'SG\.[0-9A-Za-z\-_]{22}\.[0-9A-Za-z\-_]{43}',
+    'NPM Token': r'npm_[0-9a-zA-Z]{36}',
+    'PyPI Token': r'pypi-AgEIcHlwaS5vcmc[0-9A-Za-z\-_]{50,}',
+    'Azure Storage Key': r'DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[0-9a-zA-Z+/=]{88}',
+    'JWT Token': r'eyJ[A-Za-z0-9-_=]+\.eyJ[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*',
+    'Generic API Key': r'[aA][pP][iI]_?[kK][eE][yY].*[\'"][0-9a-zA-Z]{32,45}[\'"]',
+    'Generic Secret': r'[sS][eE][cC][rR][eE][tT].*[\'"][0-9a-zA-Z]{32,45}[\'"]',
+    'Password in Code': r'[pP][aA][sS][sS][wW][oO][rR][dD].*[\'"][^\'"]{8,}[\'"]',
+    'Private Key': r'-----BEGIN (RSA|DSA|EC|OPENSSH) PRIVATE KEY-----',
+    'Firebase URL': r'.*\.firebaseio\.com',
+    'RSA Private Key': r'-----BEGIN RSA PRIVATE KEY-----',
+    'SSH Private Key': r'-----BEGIN OPENSSH PRIVATE KEY-----',
+    'PGP Private Key': r'-----BEGIN PGP PRIVATE KEY BLOCK-----',
+}
 
 
 def is_valid_url(url):
@@ -92,6 +134,134 @@ def download_file(url, output_path, session):
     except Exception as e:
         print(f"  Error downloading {url}: {e}")
         return False
+
+
+def scan_file_for_secrets(file_path):
+    """
+    Scan a single file for secrets using regex patterns.
+    Returns a list of findings.
+    """
+    findings = []
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            
+        for secret_type, pattern in SECRET_PATTERNS.items():
+            matches = re.finditer(pattern, content)
+            for match in matches:
+                # Get line number
+                line_num = content[:match.start()].count('\n') + 1
+                
+                # Get the line content
+                lines = content.split('\n')
+                line_content = lines[line_num - 1].strip() if line_num <= len(lines) else ''
+                
+                # Extract context (50 chars before and after)
+                start = max(0, match.start() - 50)
+                end = min(len(content), match.end() + 50)
+                context = content[start:end].replace('\n', ' ')
+                
+                findings.append({
+                    'file': file_path,
+                    'type': secret_type,
+                    'match': match.group(),
+                    'line': line_num,
+                    'line_content': line_content,
+                    'context': context
+                })
+    
+    except Exception as e:
+        print(f"  Error scanning {file_path}: {e}")
+    
+    return findings
+
+
+def scan_directory_for_secrets(directory):
+    """
+    Scan all .js files in a directory for secrets.
+    """
+    print(f"\n{'=' * 60}")
+    print(f"SCANNING FOR SECRETS IN: {directory}")
+    print(f"{'=' * 60}\n")
+    
+    all_findings = []
+    files_scanned = 0
+    
+    # Find all .js files
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.endswith('.js'):
+                file_path = os.path.join(root, file)
+                files_scanned += 1
+                print(f"Scanning: {file_path}")
+                
+                findings = scan_file_for_secrets(file_path)
+                if findings:
+                    all_findings.extend(findings)
+                    print(f"  ⚠️  Found {len(findings)} potential secret(s)")
+                else:
+                    print(f"  ✓ Clean")
+    
+    # Print summary
+    print(f"\n{'=' * 60}")
+    print(f"SCAN SUMMARY")
+    print(f"{'=' * 60}")
+    print(f"Files scanned: {files_scanned}")
+    print(f"Potential secrets found: {len(all_findings)}")
+    print(f"{'=' * 60}\n")
+    
+    if all_findings:
+        # Group findings by type
+        findings_by_type = {}
+        for finding in all_findings:
+            secret_type = finding['type']
+            if secret_type not in findings_by_type:
+                findings_by_type[secret_type] = []
+            findings_by_type[secret_type].append(finding)
+        
+        # Print detailed findings
+        print(f"DETAILED FINDINGS:")
+        print(f"{'=' * 60}\n")
+        
+        for secret_type, findings in findings_by_type.items():
+            print(f"\n🔍 {secret_type} ({len(findings)} found)")
+            print("-" * 60)
+            
+            for i, finding in enumerate(findings, 1):
+                print(f"\n  [{i}] File: {finding['file']}")
+                print(f"      Line: {finding['line']}")
+                print(f"      Match: {finding['match'][:100]}{'...' if len(finding['match']) > 100 else ''}")
+                print(f"      Context: ...{finding['context']}...")
+        
+        # Save to JSON file
+        output_file = os.path.join(directory, 'secrets_scan_results.json')
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                'scan_date': datetime.now().isoformat(),
+                'directory': directory,
+                'files_scanned': files_scanned,
+                'total_findings': len(all_findings),
+                'findings': all_findings,
+                'findings_by_type': {k: len(v) for k, v in findings_by_type.items()}
+            }, f, indent=2)
+        
+        print(f"\n{'=' * 60}")
+        print(f"⚠️  SECURITY WARNING:")
+        print(f"Found {len(all_findings)} potential secrets in {files_scanned} files!")
+        print(f"Detailed results saved to: {output_file}")
+        print(f"{'=' * 60}\n")
+        print("⚡ RECOMMENDATIONS:")
+        print("  1. Review each finding carefully (some may be false positives)")
+        print("  2. Rotate any exposed credentials immediately")
+        print("  3. Never commit secrets to version control")
+        print("  4. Use environment variables or secret management tools")
+        print("  5. Consider using tools like git-secrets or TruffleHog")
+        print(f"{'=' * 60}\n")
+    else:
+        print("✓ No secrets detected in scanned files.\n")
+    
+    return all_findings
 
 
 def crawl_and_download_js(domain, output_dir='downloaded_js', max_pages=50):
@@ -195,13 +365,15 @@ def crawl_and_download_js(domain, output_dir='downloaded_js', max_pages=50):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Download all JavaScript files from a given domain',
+        description='Download all JavaScript files from a given domain and optionally scan for secrets',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s -d https://example.com
   %(prog)s -d example.com -o my_js_files
   %(prog)s -d https://example.com -m 100
+  %(prog)s -d https://example.com --scan
+  %(prog)s -d https://example.com -o my_js_files --scan
         """
     )
     
@@ -224,12 +396,24 @@ Examples:
         help='Maximum number of pages to crawl (default: 50)'
     )
     
+    parser.add_argument(
+        '--scan',
+        action='store_true',
+        help='Scan downloaded JS files for API keys, tokens, and secrets'
+    )
+    
     args = parser.parse_args()
     
     try:
+        # Download JS files
         crawl_and_download_js(args.domain, args.output, args.max_pages)
+        
+        # Scan for secrets if flag is set
+        if args.scan:
+            scan_directory_for_secrets(args.output)
+        
     except KeyboardInterrupt:
-        print("\n\nDownload interrupted by user.")
+        print("\n\nProcess interrupted by user.")
         sys.exit(1)
     except Exception as e:
         print(f"\nError: {e}")
